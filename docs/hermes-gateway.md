@@ -135,7 +135,68 @@ The main Hermes agent acts as an orchestrator with these tools:
 | `read_agent_context` | Read another agent's recent conversation history for coordination |
 
 Sub-agents appear in the office as separate characters and keep their
-own conversation state.
+own conversation state. Each agent's files (`IDENTITY.md`, `SOUL.md`,
+`AGENTS.md`, `TOOLS.md`, `USER.md`, `HEARTBEAT.md`, `MEMORY.md`), such as
+the ones the company builder writes, are appended to its system prompt.
+
+### Using the team tools with Hermes Agent
+
+Hermes Agent's API server runs its own toolset and ignores tools sent by
+the client, so the tools above never reach the model through
+`/v1/chat/completions`. The adapter also serves the team tools
+(`list_team`, `delegate_task`, `read_agent_context`) as an MCP endpoint
+at `/mcp` on the adapter port. Point Hermes at it:
+
+1. Add a shared token to `~/.hermes/.env` and pass the same value to the
+   adapter as `HERMES3D_MCP_TOKEN`:
+
+   ```bash
+   echo "HERMES3D_MCP_TOKEN=$(openssl rand -hex 32)" >> ~/.hermes/.env
+   ```
+
+2. Add the server to `~/.hermes/config.yaml`:
+
+   ```yaml
+   mcp_servers:
+     office:
+       url: "http://127.0.0.1:18789/mcp"
+       headers:
+         Authorization: "Bearer ${HERMES3D_MCP_TOKEN}"
+       timeout: 900
+   ```
+
+3. Start the adapter before `hermes gateway`, so the endpoint is up when
+   Hermes connects. `hermes mcp test office` should list three tools.
+
+Hermes then sees `mcp_office_list_team`, `mcp_office_delegate_task`, and
+`mcp_office_read_agent_context`, and delegated work runs as the office
+agent (its prompt, history, and character in the office). Delegation is
+guarded: a busy agent can't take a second task, the orchestrator can't
+delegate to itself, and at most four delegations run at once.
+
+### Command modes and approvals
+
+Each agent's command mode from Studio (off / ask / auto) is applied to
+Hermes' `approval.request` events for that agent's runs:
+
+| Mode | Risky command flagged by Hermes |
+|---|---|
+| `auto` | Approved immediately |
+| `ask` | Shown in the office approvals panel (Allow once / Allow this session / Deny) |
+| `off` | Denied; the agent is also told not to run commands or change files |
+
+Hermes only routes flagged commands to the client in `manual` approval
+mode. In its default `smart` mode its own guardian approves low-risk
+flagged commands before the adapter sees them, so set:
+
+```bash
+hermes config set approvals.mode manual
+```
+
+Routine commands that Hermes does not flag run without an approval in
+every mode, and Hermes can't limit tools per request, so `off` relies on
+the agent's instructions plus denial of anything flagged. Unanswered
+approvals are denied after Hermes' `approvals.timeout` (300s by default).
 
 ## Production-readiness notes
 
@@ -168,6 +229,9 @@ Conversation history is stored at:
 ```
 
 It is loaded on startup and updated when conversations change.
+
+Created agents, their files, and their command modes are stored at
+`~/.hermes/hermes3d-agents.json`, so they survive adapter restarts.
 
 ## Current limitations
 
