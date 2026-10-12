@@ -132,6 +132,7 @@ import {
   HQSidebar,
   type HQSidebarTab,
 } from "@/features/office/components/HQSidebar";
+import { OfficeApprovalsPanel } from "@/features/office/components/OfficeApprovalsPanel";
 import { CompanyBuilderModal } from "@/features/company-builder/components/CompanyBuilderModal";
 import {
   buildGenerateCompanyPlanPrompt,
@@ -4463,6 +4464,7 @@ export function OfficeScreen({
 
   return (
     <main className="relative h-full w-full overflow-hidden bg-black">
+      <OfficeApprovalsPanel client={client} status={status} agents={state.agents} />
       {showGatewayLoadingOverlay ? (
         <div
           className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-[#120a05]/76"

@@ -26,6 +26,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
+const { createOfficeMcpHandler } = require("./office-mcp");
 
 function loadDotenvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -92,7 +93,12 @@ When given a goal:
 5. Synthesise results into a final answer for the user.
 
 Each spawned agent will appear as an animated character in the 3D office — walking when active, standing when idle.
-Be concise in your responses to the user; do the heavy lifting via tool calls.`;
+Be concise in your responses to the user; do the heavy lifting via tool calls.
+
+If those tools are not available directly, the office team is exposed to you as MCP tools from the "office" server
+(mcp_office_list_team, mcp_office_delegate_task, mcp_office_read_agent_context). Always use them to give work to
+office team members. Do not use your built-in delegate_task or subagents for work that belongs to a team member's
+role; the user wants to see their office team do the work.`;
 
 // ---------------------------------------------------------------------------
 // Team management tools definition (OpenAI tool-calling format)
@@ -208,6 +214,12 @@ const sessionSettings = new Map();
 /** @type {Map<string, string>} agentId/filename → content */
 const agentFiles = new Map();
 
+/**
+ * Office exec-approvals policy per agent, as written by Studio's exec.approvals.set.
+ * @type {Record<string, {security?: string, ask?: string, allowlist?: Array<{pattern: string}>}>}
+ */
+let execApprovals = {};
+
 /** @type {Map<string, {runId: string, sessionKey: string, agentId: string, abort: () => void}>} runId → abort handle */
 const activeRuns = new Map();
 
@@ -274,6 +286,99 @@ function saveHistoryToDisk() {
       console.warn("[hermes-adapter] Could not save history:", sanitizeErrorMessage(err));
     }
   }, 500);
+}
+
+// ---------------------------------------------------------------------------
+// Disk persistence for agents and their files (so created agents survive restarts)
+// ---------------------------------------------------------------------------
+
+const AGENTS_FILE = path.join(HOME, ".hermes", "hermes3d-agents.json");
+let agentsPersistTimer = null;
+
+function loadAgentsFromDisk() {
+  try {
+    if (!fs.existsSync(AGENTS_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(AGENTS_FILE, "utf8"));
+    for (const agent of Array.isArray(data?.agents) ? data.agents : []) {
+      if (agent && typeof agent.id === "string" && agent.id !== AGENT_ID) {
+        agentRegistry.set(agent.id, agent);
+      }
+    }
+    for (const [key, content] of Object.entries(data?.files ?? {})) {
+      if (typeof content === "string") agentFiles.set(key, content);
+    }
+    if (data?.execApprovals && typeof data.execApprovals === "object") execApprovals = data.execApprovals;
+    for (const [key, exec] of Object.entries(data?.sessionExec ?? {})) {
+      if (exec && typeof exec === "object") sessionSettings.set(key, { ...(sessionSettings.get(key) || {}), ...exec });
+    }
+    console.log(`[hermes-adapter] Loaded ${agentRegistry.size - 1} saved agent(s).`);
+  } catch (err) {
+    console.warn("[hermes-adapter] Could not load agents:", sanitizeErrorMessage(err));
+  }
+}
+
+function saveAgentsToDisk() {
+  if (agentsPersistTimer) clearTimeout(agentsPersistTimer);
+  agentsPersistTimer = setTimeout(() => {
+    try {
+      // The main orchestrator is rebuilt from code on every start, so only its files are saved.
+      const agents = [...agentRegistry.values()].filter((agent) => agent.id !== AGENT_ID);
+      const files = Object.fromEntries(
+        [...agentFiles.entries()].filter(([key]) => agentRegistry.has(key.split("/")[0])),
+      );
+      // Command settings (see resolveCommandMode) arrive per session from Studio; keep them too.
+      const sessionExec = {};
+      for (const [key, s] of sessionSettings.entries()) {
+        if (s.execHost || s.execSecurity || s.execAsk) {
+          sessionExec[key] = { execHost: s.execHost, execSecurity: s.execSecurity, execAsk: s.execAsk };
+        }
+      }
+      fs.mkdirSync(path.dirname(AGENTS_FILE), { recursive: true });
+      fs.writeFileSync(AGENTS_FILE, JSON.stringify({ agents, files, execApprovals, sessionExec }, null, 2), "utf8");
+    } catch (err) {
+      console.warn("[hermes-adapter] Could not save agents:", sanitizeErrorMessage(err));
+    }
+  }, 500);
+}
+
+// Agent files written by Studio (e.g. by the company builder), in the order they are
+// appended to the agent's base system prompt.
+const PROMPT_FILE_ORDER = ["IDENTITY.md", "SOUL.md", "AGENTS.md", "TOOLS.md", "USER.md", "HEARTBEAT.md", "MEMORY.md"];
+
+/**
+ * The agent's office command mode ("off" | "ask" | "auto"). Studio sends the session's exec settings
+ * with every message, so those win; then the agent's exec-approvals policy. Unknown → "ask".
+ */
+function resolveCommandMode(agentId) {
+  const session = sessionSettings.get(`agent:${agentId}:${MAIN_KEY}`) || {};
+  if (session.execSecurity === "deny") return "off";
+  if (session.execSecurity === "full") return "auto";
+  if (session.execSecurity === "allowlist") return "ask";
+  const policy = execApprovals[agentId];
+  if (policy?.security === "full") return "auto";
+  if (policy?.security === "allowlist") return "ask";
+  return "ask";
+}
+
+// Hermes only asks for approval on commands it flags as dangerous, and its tools can't be limited
+// per request, so "off" is also stated to the agent (and any approval it triggers is denied).
+const COMMAND_POLICY_PROMPTS = {
+  off: "Command policy (set by the user in Hermes3D): you may NOT run terminal commands, execute code, " +
+    "or create, modify, or delete files. Use only read-only tools such as reading files, searching, and " +
+    "browsing. If a task needs a command or a file change, say exactly what is needed and stop.",
+  ask: "Command policy (set by the user in Hermes3D): run commands normally when a task needs them. " +
+    "The system pauses risky commands and asks the user to approve them in the office, so you do not " +
+    "need to ask first. If an approval is denied, do not retry the command or work around it.",
+  auto: "",
+};
+
+function buildSystemPrompt(agentId) {
+  const agent = agentRegistry.get(agentId);
+  const sections = PROMPT_FILE_ORDER
+    .map((name) => (agentFiles.get(`${agentId}/${name}`) || "").trim())
+    .filter(Boolean);
+  const commandPolicy = COMMAND_POLICY_PROMPTS[resolveCommandMode(agentId)];
+  return [agent?.systemPrompt || "", ...sections, commandPolicy].filter(Boolean).join("\n\n");
 }
 
 function getHistory(sessionKey) {
@@ -474,7 +579,13 @@ async function completeOneTurn(messages, model, tools) {
  * Stream one LLM turn.
  * @returns {{ textContent: string, toolCalls: Array<{id,name,args}>, finishReason: string }}
  */
-async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
+/**
+ * @param {((progress: {tool: string, label?: string, toolCallId: string, status: string}) => void) | undefined} onToolProgress
+ *   Called for Hermes' `hermes.tool.progress` SSE events (tool start/complete while the agent works).
+ * @param {((event: Record<string, unknown>) => void) | undefined} onApprovalRequest
+ *   Called for Hermes' `approval.request` SSE events; the run waits until the approval is answered.
+ */
+async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck, onToolProgress, onApprovalRequest) {
   const body = { model, messages, stream: true };
   if (tools && tools.length > 0) { body.tools = tools; body.tool_choice = "auto"; }
 
@@ -491,6 +602,8 @@ async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
   /** @type {Record<number, {id: string, name: string, argsStr: string}>} */
   const toolCallAccum = {};
   let buffer = "";
+  let sseEvent = "";
+  let sawChunk = false;
 
   await new Promise((resolve, reject) => {
     res.on("data", (chunk) => {
@@ -500,12 +613,23 @@ async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || trimmed === "data: [DONE]") continue;
+        if (!trimmed) { sseEvent = ""; continue; }
+        if (trimmed.startsWith("event:")) { sseEvent = trimmed.slice(6).trim(); continue; }
+        if (trimmed === "data: [DONE]") continue;
         if (!trimmed.startsWith("data: ")) continue;
         try {
           const data = JSON.parse(trimmed.slice(6));
+          if (sseEvent === "hermes.tool.progress") {
+            if (onToolProgress && data && typeof data.tool === "string") onToolProgress(data);
+            continue;
+          }
+          if (sseEvent === "approval.request") {
+            if (onApprovalRequest && data && typeof data === "object") onApprovalRequest(data);
+            continue;
+          }
           const choice = data?.choices?.[0];
           if (!choice) continue;
+          sawChunk = true;
           if (typeof choice.finish_reason === "string" && choice.finish_reason) {
             finishReason = choice.finish_reason;
           }
@@ -538,7 +662,10 @@ async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
     return { id: tc.id, name: tc.name, args };
   });
 
-  if (!textContent.trim() && toolCalls.length === 0 && finishReason === "stop") {
+  // Only fall back to a non-streaming request when the server didn't stream at all. If it
+  // streamed and simply ended without text, re-sending would make Hermes run the whole
+  // agent turn (and any commands it ran) a second time.
+  if (!sawChunk && !textContent.trim() && toolCalls.length === 0 && finishReason === "stop") {
     const fallback = await completeOneTurn(messages, resolvedModel, tools);
     return {
       textContent: fallback.textContent,
@@ -582,6 +709,7 @@ async function execSpawnAgent(args) {
     id: newId, name, workspace: `${HOME}/.hermes/workspace-${slug}`,
     role, systemPrompt, settings: { wipe, continuity, model, boundaries },
   });
+  saveAgentsToDisk();
 
   console.log(`[hermes-adapter] Spawned agent: ${name} (${newId})`);
 
@@ -602,6 +730,79 @@ async function execSpawnAgent(args) {
   return JSON.stringify({ ok: true, agent_id: newId, name, role });
 }
 
+// Office "agent" tool event for a Hermes tool.progress update (same shape the hermes-agent bridge
+// emits). Only tool starts are forwarded: the office adds one activity line per tool event.
+function toolProgressPayload(runId, sessionKey, progress) {
+  if (progress.status === "completed") return null;
+  const label = typeof progress.label === "string" ? progress.label : "";
+  return {
+    runId, sessionKey, stream: "tool",
+    data: {
+      phase: "start", name: progress.tool, text: label,
+      toolCallId: typeof progress.toolCallId === "string" ? progress.toolCallId : "",
+      arguments: label ? { action: label } : null,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Command approvals: Hermes' approval.request (a command it flagged as dangerous) is answered
+// per the agent's office command mode — auto approves, off denies, ask shows it in the office.
+// ---------------------------------------------------------------------------
+
+const APPROVAL_TIMEOUT_MS = 300_000; // Hermes' default approvals.timeout; it denies after that
+
+/** @type {Map<string, {hermesRunId: string, requestId: string, agentId: string, timer: NodeJS.Timeout, requestPayload: object}>} */
+const pendingApprovals = new Map();
+
+async function answerHermesApproval(hermesRunId, requestId, choice) {
+  const body = requestId ? { choice, request_id: requestId } : { choice };
+  const res = await hermesPost(`/v1/runs/${encodeURIComponent(hermesRunId)}/approval`, body);
+  res.resume();
+  if (res.statusCode >= 400) throw new Error(`Hermes approval HTTP ${res.statusCode}`);
+}
+
+function handleApprovalRequest({ agentId, sessionKey, event }) {
+  const hermesRunId = typeof event.run_id === "string" ? event.run_id : "";
+  if (!hermesRunId) return;
+  const requestId = typeof event.request_id === "string" ? event.request_id : "";
+  const command = (typeof event.command === "string" && event.command) ||
+    (typeof event.description === "string" && event.description) || "command";
+  const agentName = agentRegistry.get(agentId)?.name || agentId;
+  const mode = resolveCommandMode(agentId);
+
+  if (mode !== "ask") {
+    const choice = mode === "auto" ? "once" : "deny";
+    console.log(`[hermes-adapter] ${choice === "once" ? "Auto-approved" : "Denied"} (${mode}) for ${agentName}: ${command}`);
+    answerHermesApproval(hermesRunId, requestId, choice).catch((err) =>
+      console.warn("[hermes-adapter] Could not answer approval:", sanitizeErrorMessage(err)));
+    return;
+  }
+
+  const approvalId = randomId();
+  const createdAtMs = Date.now();
+  const timer = setTimeout(() => {
+    pendingApprovals.delete(approvalId);
+    broadcastEvent({ type: "event", event: "exec.approval.resolved",
+      payload: { id: approvalId, decision: "deny", resolvedBy: "timeout", ts: Date.now() } });
+  }, APPROVAL_TIMEOUT_MS);
+  const requestPayload = {
+    id: approvalId,
+    request: { command, cwd: null, host: "gateway", security: "allowlist", ask: "always",
+      agentId, resolvedPath: null, sessionKey },
+    createdAtMs, expiresAtMs: createdAtMs + APPROVAL_TIMEOUT_MS,
+  };
+  pendingApprovals.set(approvalId, { hermesRunId, requestId, agentId, timer, requestPayload });
+  console.log(`[hermes-adapter] Waiting for approval (${agentName}): ${command}`);
+  broadcastEvent({ type: "event", event: "exec.approval.requested", payload: requestPayload });
+}
+
+// Office "agent" lifecycle event. "start" marks the agent as running, which the office requires
+// before it accepts that run's tool activity; "end"/"error" set it back to idle/error.
+function lifecyclePayload(runId, sessionKey, phase) {
+  return { runId, sessionKey, stream: "lifecycle", data: { phase } };
+}
+
 async function execDelegateTask(args) {
   const targetId = typeof args.agent_id === "string" ? args.agent_id.trim() : "";
   const message = typeof args.message === "string" ? args.message.trim() : "";
@@ -615,7 +816,8 @@ async function execDelegateTask(args) {
   const model = agent.settings.model || HERMES_MODEL;
 
   // Build messages for sub-agent
-  const systemMsg = agent.systemPrompt ? [{ role: "system", content: agent.systemPrompt }] : [];
+  const systemPrompt = buildSystemPrompt(targetId);
+  const systemMsg = systemPrompt ? [{ role: "system", content: systemPrompt }] : [];
   const contextHistory = agent.settings.wipe ? [] : [...history];
   const messages = [...systemMsg, ...contextHistory, { role: "user", content: message }];
 
@@ -627,6 +829,12 @@ async function execDelegateTask(args) {
       payload: { runId: subRunId, sessionKey, state, ...extra } });
   };
 
+  const emitSubLifecycle = (phase) => {
+    broadcastEvent({ type: "event", event: "agent", seq: seqCounter++,
+      payload: lifecyclePayload(subRunId, sessionKey, phase) });
+  };
+
+  emitSubLifecycle("start");
   emitSub("delta", { message: { role: "assistant", content: "…" } });
 
   let responseText = "";
@@ -634,7 +842,10 @@ async function execDelegateTask(args) {
     const result = await streamOneTurn(messages, model, [], (partial) => {
       responseText = partial;
       emitSub("delta", { message: { role: "assistant", content: partial } });
-    }, null);
+    }, null, (progress) => {
+      const payload = toolProgressPayload(subRunId, sessionKey, progress);
+      if (payload) broadcastEvent({ type: "event", event: "agent", seq: seqCounter++, payload });
+    }, (event) => handleApprovalRequest({ agentId: targetId, sessionKey, event }));
     responseText = result.textContent;
 
     // Persist to sub-agent history
@@ -645,6 +856,7 @@ async function execDelegateTask(args) {
     }
 
     emitSub("final", { stopReason: "end_turn", message: { role: "assistant", content: responseText } });
+    emitSubLifecycle("end");
 
     // Presence update for sub-agent session
     broadcastEvent({
@@ -655,6 +867,7 @@ async function execDelegateTask(args) {
   } catch (err) {
     const message = sanitizeErrorMessage(err);
     emitSub("error", { errorMessage: message });
+    emitSubLifecycle("error");
     return JSON.stringify({ ok: false, error: message });
   }
 
@@ -685,6 +898,7 @@ function execConfigureAgent(args) {
     }
   }
   if (typeof args.model === "string" && args.model.trim()) agent.settings.model = args.model.trim();
+  saveAgentsToDisk();
   console.log(`[hermes-adapter] Configured agent: ${agent.name} (${targetId})`);
   broadcastEvent({
     type: "event", event: "presence",
@@ -708,6 +922,7 @@ function execDismissAgent(args) {
   if (!agent) return JSON.stringify({ ok: false, error: `Agent ${targetId} not found` });
   agentRegistry.delete(targetId);
   clearHistory(`agent:${targetId}:${MAIN_KEY}`);
+  saveAgentsToDisk();
   console.log(`[hermes-adapter] Dismissed agent: ${agent.name} (${targetId})`);
   return JSON.stringify({ ok: true, dismissed: targetId });
 }
@@ -756,9 +971,11 @@ async function executeToolCall(tc, sendEvent) {
 // Agentic loop — handles multi-round tool-calling conversations
 // ---------------------------------------------------------------------------
 
-async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, emitDelta, abortCheck, sendEvent }) {
+async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, emitDelta, abortCheck, sendEvent, onToolProgress }) {
+  const onApprovalRequest = (event) => handleApprovalRequest({ agentId, sessionKey, event });
   const agent = agentRegistry.get(agentId);
-  const systemMsg = agent?.systemPrompt ? [{ role: "system", content: agent.systemPrompt }] : [];
+  const systemPrompt = buildSystemPrompt(agentId);
+  const systemMsg = systemPrompt ? [{ role: "system", content: systemPrompt }] : [];
   const history = getHistory(sessionKey);
   const contextHistory = (agent?.settings?.wipe) ? [] : [...history];
   let messages = [...systemMsg, ...contextHistory, { role: "user", content: userMessage }];
@@ -769,7 +986,7 @@ async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, 
   while (round < MAX_TOOL_ROUNDS) {
     round++;
     const { textContent, toolCalls, finishReason } = await streamOneTurn(
-      messages, model, tools, emitDelta, abortCheck
+      messages, model, tools, emitDelta, abortCheck, onToolProgress, onApprovalRequest
     );
 
     if (finishReason === "tool_calls" && toolCalls.length > 0) {
@@ -851,6 +1068,7 @@ async function handleMethod(method, params, id, sendEvent) {
         role: "", systemPrompt: `You are ${agentName}.`,
         settings: { wipe: false, continuity: true, model: HERMES_MODEL },
       });
+      saveAgentsToDisk();
       return resOk(id, { agentId: newId, name: agentName, workspace });
     }
 
@@ -859,6 +1077,7 @@ async function handleMethod(method, params, id, sendEvent) {
       if (delId && delId !== AGENT_ID) {
         agentRegistry.delete(delId);
         clearHistory(`agent:${delId}:${MAIN_KEY}`);
+        saveAgentsToDisk();
       }
       return resOk(id, { ok: true, removedBindings: 0 });
     }
@@ -870,6 +1089,7 @@ async function handleMethod(method, params, id, sendEvent) {
         if (typeof p.name === "string" && p.name.trim()) existing.name = p.name.trim();
         if (typeof p.workspace === "string" && p.workspace.trim()) existing.workspace = p.workspace.trim();
         if (typeof p.role === "string") existing.role = p.role.trim();
+        saveAgentsToDisk();
       }
       return resOk(id, { ok: true, removedBindings: 0 });
     }
@@ -883,6 +1103,7 @@ async function handleMethod(method, params, id, sendEvent) {
     case "agents.files.set": {
       const key = `${p.agentId || AGENT_ID}/${p.name || ""}`;
       agentFiles.set(key, typeof p.content === "string" ? p.content : "");
+      saveAgentsToDisk();
       return resOk(id, {});
     }
 
@@ -910,6 +1131,9 @@ async function handleMethod(method, params, id, sendEvent) {
           origin: { label: agent.name, provider: "hermes" },
           model: settings.model || agent.settings?.model || HERMES_MODEL,
           modelProvider: "hermes",
+          execHost: settings.execHost ?? null,
+          execSecurity: settings.execSecurity ?? null,
+          execAsk: settings.execAsk ?? null,
         };
       });
       return resOk(id, { sessions });
@@ -942,6 +1166,7 @@ async function handleMethod(method, params, id, sendEvent) {
       if (p.execSecurity !== undefined) next.execSecurity = p.execSecurity;
       if (p.execAsk !== undefined) next.execAsk = p.execAsk;
       sessionSettings.set(key, next);
+      if (p.execHost !== undefined || p.execSecurity !== undefined || p.execAsk !== undefined) saveAgentsToDisk();
       const resolvedModel = await resolveHermesModel(next.model || HERMES_MODEL);
       return resOk(id, { ok: true, key, entry: { thinkingLevel: next.thinkingLevel },
         resolved: { model: resolvedModel, modelProvider: "hermes" } });
@@ -989,6 +1214,10 @@ async function handleMethod(method, params, id, sendEvent) {
           if (!aborted) emitChat("delta", { message: { role: "assistant", content: partial } });
         };
 
+        let lifecycleEnd = "end";
+        sendEvent({ type: "event", event: "agent", seq: seqCounter++,
+          payload: lifecyclePayload(runId, sessionKey, "start") });
+
         try {
           // Only the orchestrator gets team management tools
           const tools = isOrchestrator ? TEAM_TOOLS : [];
@@ -997,6 +1226,10 @@ async function handleMethod(method, params, id, sendEvent) {
             sessionKey, agentId: sessionAgentId, userMessage,
             model, tools, emitDelta: onTextDelta,
             abortCheck: () => aborted, sendEvent,
+            onToolProgress: (progress) => {
+              const payload = toolProgressPayload(runId, sessionKey, progress);
+              if (payload && !aborted) sendEvent({ type: "event", event: "agent", seq: seqCounter++, payload });
+            },
           });
 
           if (aborted) {
@@ -1009,10 +1242,14 @@ async function handleMethod(method, params, id, sendEvent) {
                 byAgent: [{ agentId: sessionAgentId, recent: [{ key: sessionKey, updatedAt: Date.now() }] }] } } });
           }
         } catch (err) {
-          if (!aborted) emitChat("error", { errorMessage: sanitizeErrorMessage(err) || "Hermes API error" });
-          else emitChat("aborted", {});
+          if (!aborted) {
+            emitChat("error", { errorMessage: sanitizeErrorMessage(err) || "Hermes API error" });
+            lifecycleEnd = "error";
+          } else emitChat("aborted", {});
         } finally {
           activeRuns.delete(runId);
+          sendEvent({ type: "event", event: "agent", seq: seqCounter++,
+            payload: lifecyclePayload(runId, sessionKey, lifecycleEnd) });
         }
       });
 
@@ -1058,14 +1295,39 @@ async function handleMethod(method, params, id, sendEvent) {
     // --- Approvals ----------------------------------------------------------
 
     case "exec.approvals.get":
-      return resOk(id, { path: "", exists: true, hash: "hermes-approvals",
-        file: { version: 1, defaults: { security: "full", ask: "off", autoAllowSkills: true }, agents: {} } });
+      return resOk(id, { path: AGENTS_FILE, exists: true, hash: "hermes-approvals",
+        file: { version: 1, defaults: { security: "allowlist", ask: "always", autoAllowSkills: true },
+          agents: execApprovals } });
 
-    case "exec.approvals.set":
+    case "exec.approvals.set": {
+      const agents = p.file?.agents;
+      if (agents && typeof agents === "object" && !Array.isArray(agents)) {
+        execApprovals = agents;
+        saveAgentsToDisk();
+      }
       return resOk(id, { hash: "hermes-approvals" });
+    }
 
-    case "exec.approval.resolve":
+    case "exec.approval.resolve": {
+      const approvalId = typeof p.id === "string" ? p.id : "";
+      const pending = pendingApprovals.get(approvalId);
+      if (!pending) return resErr(id, "NOT_FOUND", "That approval has expired or was already answered.");
+      const decision = p.decision === "allow-once" || p.decision === "allow-always" ? p.decision : "deny";
+      // "Allow always" is scoped to this Hermes session: Hermes' own "always" would permanently
+      // allowlist the command for every agent.
+      const choice = decision === "allow-once" ? "once" : decision === "allow-always" ? "session" : "deny";
+      clearTimeout(pending.timer);
+      pendingApprovals.delete(approvalId);
+      try {
+        await answerHermesApproval(pending.hermesRunId, pending.requestId, choice);
+      } catch (err) {
+        return resErr(id, "APPROVAL_FAILED", sanitizeErrorMessage(err));
+      }
+      console.log(`[hermes-adapter] Approval ${approvalId} answered: ${decision}`);
+      broadcastEvent({ type: "event", event: "exec.approval.resolved",
+        payload: { id: approvalId, decision, resolvedBy: "user", ts: Date.now() } });
       return resOk(id, { ok: true });
+    }
 
     // --- Status & heartbeat -------------------------------------------------
 
@@ -1173,8 +1435,32 @@ async function handleMethod(method, params, id, sendEvent) {
 // WebSocket server
 // ---------------------------------------------------------------------------
 
+function findAgentByIdOrName(idOrName) {
+  if (agentRegistry.has(idOrName)) return agentRegistry.get(idOrName);
+  const lowered = idOrName.toLowerCase();
+  return [...agentRegistry.values()].find((agent) => agent.name.toLowerCase() === lowered);
+}
+
 function startAdapter() {
+  const handleOfficeMcp = createOfficeMcpHandler({
+    token: process.env.HERMES3D_MCP_TOKEN || "",
+    orchestratorId: AGENT_ID,
+    findAgent: findAgentByIdOrName,
+    listTeam: execListTeam,
+    delegateTask: execDelegateTask,
+    readAgentContext: execReadAgentContext,
+    log: (msg) => console.log(`[hermes-adapter] office MCP: ${msg}`),
+  });
+
   const httpServer = http.createServer((req, res) => {
+    if ((req.url || "").split("?")[0] === "/mcp") {
+      handleOfficeMcp(req, res).catch((err) => {
+        console.error("[hermes-adapter] office MCP error:", sanitizeErrorMessage(err));
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      });
+      return;
+    }
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Hermes Gateway Adapter – OK\n");
   });
@@ -1235,6 +1521,10 @@ function startAdapter() {
             policy: { tickIntervalMs: 30000 },
           },
         });
+        // Approvals requested while this page wasn't connected would otherwise never show up.
+        for (const pending of pendingApprovals.values()) {
+          sendEventFn({ type: "event", event: "exec.approval.requested", payload: pending.requestPayload });
+        }
         return;
       }
 
@@ -1276,4 +1566,5 @@ function startAdapter() {
 }
 
 loadHistoryFromDisk();
+loadAgentsFromDisk();
 startAdapter();
